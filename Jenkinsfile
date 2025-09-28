@@ -1,34 +1,75 @@
 pipeline {
-    // กำหนด Agent ที่จะใช้ (ต้องมี Docker ติดตั้ง)
+    // ใช้ any agent เพื่อหลีกเลี่ยงปัญหา Docker path mounting บน Windows
     agent any
 
-    // กำหนดเครื่องมือที่จำเป็น
-    tools {
-        maven 'Maven-3.8.5' // ชื่อที่ตั้งใน Jenkins > Global Tool Configuration
-    }
-
-    // กำหนด Environment Variables
+    // กำหนด environment variables
     environment {
-        DOCKERHUB_CREDENTIALS = 'dockerhub-credentials'
-        N8N_WEBHOOK_URL_CREDENTIALS = 'n8n-webhook-url'
-        DOCKER_IMAGE_NAME = 'iamsamitdev/springboot-docker-app'
-        DOCKER_IMAGE_TAG = "${BUILD_NUMBER}"
+        // ใช้ค่าเป็น "credentialsId" ของ Jenkins โดยตรงสำหรับ docker.withRegistry
+        DOCKER_HUB_CREDENTIALS_ID = 'dockerhub-cred'
+        DOCKER_REPO = "iamsamitdev/springboot-docker-app"
+        APP_NAME = "springboot-docker-app"
     }
 
+    // กำหนด stages ของ Pipeline
     stages {
         // Stage 1: ดึงโค้ดล่าสุดจาก Git
         stage('Checkout') {
             steps {
-                echo 'Checking out code...'
+                echo "Checking out code..."
                 checkout scm
             }
         }
 
-        // Stage 2: รัน Unit Tests และ Integration Tests
-        stage('Run Tests') {
+        // Stage 2: ติดตั้ง dependencies และรันเทสต์ (รองรับทุก Platform)
+        stage('Install & Test') {
             steps {
-                echo 'Running tests with Maven...'
-                sh 'mvn clean test'
+                script {
+                    // ตรวจสอบว่ามี Java/Maven บน host หรือไม่ ถ้ามีใช้ host; ถ้าไม่มีก็ใช้ Docker maven image
+                    def hasMaven = false
+                    def isWindows = isUnix() ? false : true
+
+                    try {
+                        if (isWindows) {
+                            bat 'mvn -v'
+                        } else {
+                            sh 'mvn -v'
+                        }
+                        hasMaven = true
+                        echo "Using Maven installed on ${isWindows ? 'Windows' : 'Unix'}"
+                    } catch (Exception e) {
+                        echo "Maven not found on host, using Docker"
+                        hasMaven = false
+                    }
+
+                    if (hasMaven) {
+                        if (isWindows) {
+                            bat '''
+                                mvn -B -ntp clean test
+                            '''
+                        } else {
+                            sh '''
+                                mvn -B -ntp clean test
+                            '''
+                        }
+                    } else {
+                        // ใช้ Docker run (maven + jdk) เพื่อรัน test ในทุก platform
+                        if (isWindows) {
+                            bat '''
+                                docker run --rm ^
+                                -v "%cd%":/workspace ^
+                                -w /workspace ^
+                                maven:3.9-eclipse-temurin-21 sh -c "mvn -B -ntp clean test"
+                            '''
+                        } else {
+                            sh '''
+                                docker run --rm \
+                                -v "$(pwd)":/workspace \
+                                -w /workspace \
+                                maven:3.9-eclipse-temurin-21 sh -c "mvn -B -ntp clean test"
+                            '''
+                        }
+                    }
+                }
             }
             post {
                 always {
@@ -47,101 +88,176 @@ pipeline {
             }
         }
 
-        // Stage 3: Build โปรเจกต์ Spring Boot ด้วย Maven
+        // Stage 3: Build โปรเจกต์ (ใช้ host maven ถ้ามี หรือ fallback docker)
         stage('Build Application') {
             steps {
-                echo 'Building the application with Maven...'
-                sh 'mvn package -DskipTests'
+                script {
+                    def hasMaven = false
+                    def isWindows = isUnix() ? false : true
+                    try {
+                        if (isWindows) { bat 'mvn -v' } else { sh 'mvn -v' }
+                        hasMaven = true
+                    } catch (Exception e) { hasMaven = false }
+
+                    if (hasMaven) {
+                        if (isWindows) {
+                            bat 'mvn -B -ntp -DskipTests package'
+                        } else {
+                            sh 'mvn -B -ntp -DskipTests package'
+                        }
+                    } else {
+                        if (isWindows) {
+                            bat '''
+                                docker run --rm ^
+                                -v "%cd%":/workspace ^
+                                -w /workspace ^
+                                maven:3.9-eclipse-temurin-21 sh -c "mvn -B -ntp -DskipTests package"
+                            '''
+                        } else {
+                            sh '''
+                                docker run --rm \
+                                -v "$(pwd)":/workspace \
+                                -w /workspace \
+                                maven:3.9-eclipse-temurin-21 sh -c "mvn -B -ntp -DskipTests package"
+                            '''
+                        }
+                    }
+                }
             }
         }
 
-        // Stage 4: สร้าง Docker Image
+        // Stage 4: สร้าง Docker Image สำหรับ production
         stage('Build Docker Image') {
             steps {
                 script {
-                    echo "Building Docker image: ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
-                    docker.build("${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}", '.')
+                    echo "Building Docker image: ${DOCKER_REPO}:${BUILD_NUMBER}"
+                    docker.build("${DOCKER_REPO}:${BUILD_NUMBER}", ".")
                 }
             }
         }
 
         // Stage 5: Push Image ไปยัง Docker Hub
-        stage('Push to Docker Hub') {
+        stage('Push Docker Image') {
             steps {
                 script {
-                    // ล็อกอินเข้า Docker Hub โดยใช้ Credentials ที่เตรียมไว้
-                    docker.withRegistry('https://registry.hub.docker.com', DOCKERHUB_CREDENTIALS) {
+                    // ต้องส่งค่าเป็น credentialsId เท่านั้น ไม่ใช่ค่าที่ mask ของ credentials()
+                    docker.withRegistry('https://index.docker.io/v1/', env.DOCKER_HUB_CREDENTIALS_ID) {
                         echo "Pushing image to Docker Hub..."
-                        docker.image("${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}").push()
-                        
-                        // (Optional) Push a 'latest' tag
-                        docker.image("${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}").push('latest')
+                        def image = docker.image("${DOCKER_REPO}:${BUILD_NUMBER}")
+                        image.push()
+                        image.push('latest')
+                    }
+                }
+            }
+        }
+
+        // Stage 6: Cleanup local Docker cache/images on the agent to save disk space
+        stage('Cleanup Docker') {
+            steps {
+                script {
+                    def isWindows = isUnix() ? false : true
+                    echo "Cleaning up local Docker images/cache on agent..."
+                    if (isWindows) {
+                        bat """
+                            docker image rm -f ${DOCKER_REPO}:${BUILD_NUMBER} || echo ignore
+                            docker image rm -f ${DOCKER_REPO}:latest || echo ignore
+                            docker image prune -af -f
+                            docker builder prune -af -f
+                        """
+                    } else {
+                        sh """
+                            docker image rm -f ${DOCKER_REPO}:${BUILD_NUMBER} || true
+                            docker image rm -f ${DOCKER_REPO}:latest || true
+                            docker image prune -af -f
+                            docker builder prune -af -f
+                        """
+                    }
+                }
+            }
+        }
+
+        // Stage 7: Deploy latest image to localhost for smoke test
+        stage('Deploy Local') {
+            steps {
+                script {
+                    def isWindows = isUnix() ? false : true
+                    echo "Deploying container ${APP_NAME} from latest image..."
+                    if (isWindows) {
+                        bat """
+                            docker pull ${DOCKER_REPO}:latest
+                            docker stop ${APP_NAME} || echo ignore
+                            docker rm ${APP_NAME} || echo ignore
+                            docker run -d --name ${APP_NAME} -p 8080:8080 ${DOCKER_REPO}:latest
+                            docker ps --filter name=${APP_NAME} --format \"table {{.Names}}\t{{.Image}}\t{{.Status}}\"
+                        """
+                    } else {
+                        sh """
+                            docker pull ${DOCKER_REPO}:latest
+                            docker stop ${APP_NAME} || true
+                            docker rm ${APP_NAME} || true
+                            docker run -d --name ${APP_NAME} -p 8080:8080 ${DOCKER_REPO}:latest
+                            docker ps --filter name=${APP_NAME} --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
+                        """
+                    }
+                }
+            }
+            post {
+                success {
+                    script {
+                        def isWindows = isUnix() ? false : true
+                        withCredentials([string(credentialsId: 'n8n-webhook', variable: 'N8N_WEBHOOK_URL')]) {
+                            if (isWindows) {
+                                // ใช้ PowerShell แบบบรรทัดเดียว (ไม่มี caret ^) เพื่อหลีกเลี่ยง error ใน cmd
+                                bat '''
+                                    powershell -NoProfile -Command "$body = [PSCustomObject]@{ project=$env:JOB_NAME; stage='Deploy Local'; status='success'; build=$env:BUILD_NUMBER; image=($env:DOCKER_REPO + ':latest'); container=$env:APP_NAME; url='http://localhost:8080/'; timestamp=(Get-Date -Format o) }; $json = $body | ConvertTo-Json; Invoke-RestMethod -Uri $env:N8N_WEBHOOK_URL -Method Post -ContentType 'application/json' -Body $json"
+                                '''
+                            } else {
+                                sh """
+                                    curl -s -X POST "$N8N_WEBHOOK_URL" \
+                                      -H 'Content-Type: application/json' \
+                                      -d '{
+                                            "project": "${JOB_NAME}",
+                                            "stage": "Deploy Local",
+                                            "status": "success",
+                                            "build": "${BUILD_NUMBER}",
+                                            "image": "${DOCKER_REPO}:latest",
+                                            "container": "${APP_NAME}",
+                                            "url": "http://localhost:8080/"
+                                          }'
+                                """
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    // Post Actions: ส่วนที่จะทำงานหลัง Stages ทั้งหมดเสร็จสิ้น
+    // แจ้งเตือนเมื่อ Pipeline ล้มเหลว (failure)
     post {
-        // ทำงานเมื่อ Pipeline สำเร็จเท่านั้น
-        success {
-            script {
-                echo 'CI process completed successfully. Notifying N8N...'
-                // ดึง N8N Webhook URL จาก Credentials
-                withCredentials([string(credentialsId: N8N_WEBHOOK_URL_CREDENTIALS, variable: 'WEBHOOK_URL')]) {
-                    // ส่ง POST request ไปยัง N8N พร้อมข้อมูลที่เป็นประโยชน์
-                    sh """
-                        curl -X POST -H "Content-Type: application/json" \\
-                        -d '{
-                            "status": "SUCCESS",
-                            "project": "${JOB_NAME}",
-                            "buildNumber": "${BUILD_NUMBER}",
-                            "imageUrl": "${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}",
-                            "dockerHubUrl": "https://hub.docker.com/r/${DOCKER_IMAGE_NAME}/tags",
-                            "testsStatus": "PASSED",
-                            "buildUrl": "${BUILD_URL}"
-                        }' \\
-                        '${WEBHOOK_URL}'
-                    """
-                }
-            }
-        }
-        // ทำงานเมื่อ Pipeline ล้มเหลว
         failure {
             script {
-                echo 'CI process failed. Notifying N8N...'
-                withCredentials([string(credentialsId: N8N_WEBHOOK_URL_CREDENTIALS, variable: 'WEBHOOK_URL')]) {
-                    sh """
-                        curl -X POST -H "Content-Type: application/json" \\
-                        -d '{
-                            "status": "FAILED",
-                            "project": "${JOB_NAME}",
-                            "buildNumber": "${BUILD_NUMBER}",
-                            "buildUrl": "${BUILD_URL}",
-                            "testsStatus": "FAILED"
-                        }' \\
-                        '${WEBHOOK_URL}'
-                    """
-                }
-            }
-        }
-        // ทำงานเมื่อ Tests ล้มเหลวแต่ build สำเร็จ
-        unstable {
-            script {
-                echo 'Tests failed but build succeeded. Notifying N8N...'
-                withCredentials([string(credentialsId: N8N_WEBHOOK_URL_CREDENTIALS, variable: 'WEBHOOK_URL')]) {
-                    sh """
-                        curl -X POST -H "Content-Type: application/json" \\
-                        -d '{
-                            "status": "UNSTABLE",
-                            "project": "${JOB_NAME}",
-                            "buildNumber": "${BUILD_NUMBER}",
-                            "buildUrl": "${BUILD_URL}",
-                            "testsStatus": "FAILED"
-                        }' \\
-                        '${WEBHOOK_URL}'
-                    """
+                def isWindows = isUnix() ? false : true
+                withCredentials([string(credentialsId: 'n8n-webhook', variable: 'N8N_WEBHOOK_URL')]) {
+                    if (isWindows) {
+                        bat '''
+                            powershell -NoProfile -Command "$body = [PSCustomObject]@{ project=$env:JOB_NAME; stage='Pipeline'; status='failed'; build=$env:BUILD_NUMBER; image=($env:DOCKER_REPO + ':latest'); container=$env:APP_NAME; url='http://localhost:8080/'; timestamp=(Get-Date -Format o) }; $json = $body | ConvertTo-Json; Invoke-RestMethod -Uri $env:N8N_WEBHOOK_URL -Method Post -ContentType 'application/json' -Body $json"
+                        '''
+                    } else {
+                        sh """
+                            curl -s -X POST "$N8N_WEBHOOK_URL" \
+                              -H 'Content-Type: application/json' \
+                              -d '{
+                                    "project": "${JOB_NAME}",
+                                    "stage": "Pipeline",
+                                    "status": "failed",
+                                    "build": "${BUILD_NUMBER}",
+                                    "image": "${DOCKER_REPO}:latest",
+                                    "container": "${APP_NAME}",
+                                    "url": "http://localhost:8080/"
+                                  }'
+                        """
+                    }
                 }
             }
         }
